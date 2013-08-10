@@ -47,6 +47,22 @@ sub import {
 my @caller_info = qw( package filepath line subroutine hasargs
     wantarray evaltext is_require hints bitmask hinthash );
 
+our (%known_proxies) = (
+    'Class::Load::load_class'                                           => 1,
+    'Class::Load::try {...} '                                           => 1,
+    'Class::Load::try_load_class'                                       => 1,
+    'Module::Runtime::require_module'                                   => 1,
+    'Module::Runtime::use_module'                                       => 1,
+    'Moo::_Utils::_load_module'                                         => 1,
+    'Moose::Meta::Attribute::Native::Trait::_native_accessor_class_for' => 1,
+    'Moose::Role::with'                                                 => 1,
+    'Moose::Util::_apply_all_roles'                                     => 1,
+    'Moose::Util::apply_all_roles'                                      => 1,
+    'Moose::with'                                                       => 1,
+    'Try::Tiny::try'                                                    => 1,
+    'base::import'                                                      => 1,
+    'parent::import'                                                    => 1,
+);
 # Keys used in the data structure:
 # - filename: parameter given to use/require
 # - module:   module, computed from filename
@@ -80,7 +96,26 @@ sub trace_use
 
     # info about the loading module
     my $caller = $info->{caller} = {};
-    @{$caller}{@caller_info} = caller(0);
+
+    my $caller_depth = 0;
+
+    my $caller_sub;
+
+    HIDE_PROXIES: {
+        $caller_sub = (caller($caller_depth+1))[3] || '';
+        if ( $caller_sub =~ /[(]eval[)]/ ) {
+            $caller_depth++;
+            redo HIDE_PROXIES;
+        }
+        if ( exists $known_proxies{$caller_sub} ) {
+            $caller_depth++;
+            redo HIDE_PROXIES;
+        }
+#        warn "Caller is >$caller_sub<";
+    }
+    @{$caller}{@caller_info} = caller($caller_depth);
+
+
 
     # try to compute a "filename" (as received by require)
     $caller->{filestring} = $caller->{filename} = $caller->{filepath};
@@ -109,8 +144,8 @@ sub trace_use
 
     # record potential proxies
     if ( $caller->{filename} ) {
-        my($subroutine, $level);
-        while ( $subroutine = ( caller ++$level )[3] || '' ) {
+        my($subroutine, $level) = ( undef , $caller_depth );
+            while ( $subroutine = ( caller ++$level  )[3] || '' ) {
             last if $subroutine =~ /::/;
         }
         $loader{ join "\0", @{$caller}{qw( filename line )}, $subroutine }++;
