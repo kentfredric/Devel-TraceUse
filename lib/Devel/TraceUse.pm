@@ -44,6 +44,55 @@ sub import {
     }
 }
 
+my $times = {};
+
+# The following code only functions under perl -d
+# and hooks into the `require` mechanism and triggers between
+# the sourced file being compiled, and the source file being run.
+#
+# So this encompasses `use` and `BEGIN` penalties
+# but no runtime penalities.
+
+{
+    # Default code ref
+    my $postponed = sub {};
+    # Take original one if one is defined
+    if ( 'DB'->can('postponed') ) {
+        $postponed = 'DB'->can('postponed');
+    }
+    *DB::postponed = sub {
+        # Call any existing hooks
+        $postponed->(@_);
+        # see perldebguts
+        # $_[0] here is "*main::_<FILENAME>"
+        # or "subname" if subnames are registered for postponed triggers.
+        my $filename = $_[0];
+        return unless $filename =~ s/^\*main::_<//;
+        # Invoke Time::HiRes if and only if it is loaded.
+        my $after = scalar time();
+        if ('Time::HiRes'->can('gettimeofday') ) {
+           $after = scalar  Time::HiRes::gettimeofday();
+        }
+        my $orig = $filename;
+        # Try to map the final required filename
+        # back to the filename that was passed to `require`
+        # by iterating %INC, which contains
+        #  Foo/Bar.pm => /full/path/here/Foo/Bar.pm
+        # mappings and we want the left hand side.
+        keyfind: for my $key ( keys %INC  ) {
+            if ( $filename eq $INC{$key} ) {
+                $orig = $key;
+                last keyfind;
+            }
+        }
+        if ( exists $times->{$orig} ) {
+            my $t = $times->{$orig};
+            $t->{finished} = $after;
+            $t->{time}   = $t->{finished} - $t->{loaded};
+        }
+    };
+}
+
 my @caller_info = qw( package filepath line subroutine hasargs
     wantarray evaltext is_require hints bitmask hinthash );
 
@@ -116,6 +165,16 @@ sub trace_use
         $loader{ join "\0", @{$caller}{qw( filename line )}, $subroutine }++;
     }
 
+    my $now = scalar time();
+    # Optimistically ask for extra precision when the mechanics exist
+    # already
+    if ('Time::HiRes'->can('gettimeofday') ) {
+        $now = scalar Time::HiRes::gettimeofday();
+    }
+    $times->{$info->{filename}} = {
+        loaded => $now
+    };
+
     # let Perl ultimately find the required file
     return;
 }
@@ -139,6 +198,13 @@ sub show_trace_visitor
         if $caller->{package} ne $caller->{filepackage};
     $message .= " (FAILED)"
         if !exists $INC{$mod->{filename}};
+
+    if ( exists $times->{$mod->{filename}} ) {
+        my $t = $times->{$mod->{filename}};
+        if ( $t->{time} > 0 ) {
+            $message .= sprintf " \e[35m%8.3fms\e[0m" , $t->{time} * 1000;
+        }
+    }
 
     $output_cb->($message, @args);
 }
@@ -178,6 +244,20 @@ sub numify {
     return 0+ join '', shift @parts, '.', map sprintf( '%03s', $_ ), @parts;
 }
 
+sub dump_hot_modules {
+    my ( $output ) = @_;
+    my ( @hot_modules ) = sort { $times->{$b}->{time} <=> $times->{$a}->{time} }
+        grep { $times->{$_}->{time} > 0 }
+        keys %{$times};
+    return unless @hot_modules;
+    $output->("Slowest Modules (inclusive):");
+    my $i = 0;
+    for my $module ( @hot_modules ){
+        $i++;
+        last if $i > 20;
+        $output->(sprintf "%8.3fms %s", $times->{$module}->{time} * 1000 , $module );
+    }
+}
 sub dump_proxies
 {
     my $output = shift;
@@ -249,7 +329,7 @@ sub dump_result
     }
 
     dump_proxies($output);
-
+    dump_hot_modules($output);
     close $output_fh if defined $output_fh;
 }
 
